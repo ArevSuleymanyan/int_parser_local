@@ -1,0 +1,19 @@
+version: "3"
+
+services:
+  parser:
+    build:
+      context: .
+      dockerfile: parser.Dockerfile
+    image: int_parser:latest
+    container_name: int_parser
+    restart: always
+    ports:
+      - 30087:30087
+    env_file:
+      - .env
+    networks:
+      - redis_network
+networks:
+  redis_network:
+    external: true
