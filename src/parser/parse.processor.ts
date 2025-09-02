@@ -28,6 +28,7 @@ export class ParseProcessor {
 
     const launchOpts: any = {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     };
 
