@@ -75,7 +75,6 @@ export class ParseProcessor {
         `DOC title="${meta.title}" body=${meta.hasBody} htmlLen=${meta.htmlLen} lang=${meta.lang}`,
       );
 
-      // было: await page.waitForTimeout(800)
       await sleep(800);
 
       const results: Array<{ field: string; value: string | null }> = [];
@@ -236,7 +235,6 @@ export class ParseProcessor {
         'utf8',
       );
 
-      // вместо path в screenshot — берём буфер и пишем сами
       try {
         const png = await page.screenshot({ type: 'png', fullPage: true });
         await fs.writeFile(path.join(dir, 'page.png'), png);

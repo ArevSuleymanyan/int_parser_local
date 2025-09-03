@@ -12,6 +12,8 @@ services:
       - 30087:30087
     env_file:
       - .env
+    volumes:
+      - /opt/parser_debug:/app/debug
     networks:
       - redis_network
 networks:
