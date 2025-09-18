@@ -7,8 +7,12 @@ import { PARSE_QUEUE } from './queue.constants';
 import { ResultWebhookService } from './webhook.service';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+puppeteerExtra.use(StealthPlugin());
 
 @Processor(PARSE_QUEUE)
 export class ParseProcessor {
@@ -47,7 +51,8 @@ export class ParseProcessor {
 
     let browser: Browser | null = null;
     try {
-      browser = await puppeteer.launch(launchOpts);
+      browser = await puppeteerExtra.launch(launchOpts);
+
       const page = await browser.newPage();
 
       await page.setExtraHTTPHeaders({
