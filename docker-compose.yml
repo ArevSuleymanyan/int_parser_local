@@ -6,16 +6,35 @@ services:
       context: .
       dockerfile: parser.Dockerfile
     image: int_parser:latest
-    container_name: int_parser
     restart: always
+    depends_on:
+      - redis
     ports:
-      - 30087:30087
+      - "4000"
     env_file:
       - .env
-    volumes:
-      - /opt/parser_debug:/app/debug
     networks:
-      - redis_network
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.parser.rule=Host(`parser.dishcovery-app.com`)"
+      - "traefik.http.routers.parser.entrypoints=websecure"
+      - "traefik.http.routers.parser.tls.certResolver=letsencrypt"
+  redis:
+    image: redis
+    environment:
+      - REDIS_REPLICATION_MODE=master
+    restart: always
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis:/data
+    networks:
+      - dokploy-network
+
+volumes:
+  redis:
+
 networks:
-  redis_network:
+  dokploy-network:
     external: true
