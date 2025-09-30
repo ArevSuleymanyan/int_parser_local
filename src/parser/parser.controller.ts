@@ -9,13 +9,7 @@ export class ParserController {
 
   @Post('enqueue')
   async enqueue(@Body() dto: EnqueueParseDto) {
-    this.logger.log(
-      `Запрос на постановку в очередь: leadId=${dto.leadId} поля=[${dto.fields.join(',')}] url=${dto.url}`,
-    );
-    const res = await this.service.enqueue(dto);
-    this.logger.log(
-      `Задача поставлена в очередь: jobId=${res.jobId} leadId=${dto.leadId}`,
-    );
-    return res;
+    console.log(123);
+    return this.service.enqueue(dto);
   }
 }

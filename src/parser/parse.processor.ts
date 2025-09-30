@@ -1,25 +1,50 @@
 import { Processor, Process } from '@nestjs/bull';
 import { Job } from 'bull';
 import { Logger } from '@nestjs/common';
-import type { Browser, Page } from 'puppeteer';
 import { PARSE_QUEUE } from './queue.constants';
 import { ResultWebhookService } from './webhook.service';
-import puppeteerExtra from 'puppeteer-extra';
-import { faker } from '@faker-js/faker';
-import { createHash } from 'crypto';
-import type { HTTPResponse } from 'puppeteer';
+const puppeteerExtra = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+import type { Browser, Page, HTTPResponse } from 'puppeteer';
+import type { Protocol } from 'devtools-protocol';
+
+puppeteerExtra.use(StealthPlugin());
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const clip = (s?: string | null, n = 800) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+async function logPagePreview(logger: Logger, page: Page, note: string) {
+  try {
+    const data = await page.evaluate(() => {
+      const title = document.title || '';
+      const text = (document.body?.innerText || '').trim();
+      const html = (document.documentElement?.outerHTML || '').trim();
+      return { title, preview: text || html };
+    });
+    logger.warn(`[PREVIEW@${note}] title="${clip(data.title, 160)}" :: ${clip(data.preview, 800)}`);
+  } catch (e) {
+    logger.warn(`[PREVIEW@${note}] не удалось получить превью: ${e}`);
+  }
+}
 
 @Processor(PARSE_QUEUE)
 export class ParseProcessor {
   private readonly logger = new Logger(ParseProcessor.name);
   constructor(private readonly webhook: ResultWebhookService) {}
 
-  @Process({
-    name: 'parse',
-    concurrency: 2,
-  })
+  private readonly proxyHost = process.env.PROXY_HOST ?? 'gate.decodo.com';
+  private readonly proxyUser = process.env.PROXY_USER ?? 'spdgkv82ag';
+  private readonly proxyPass = process.env.PROXY_PASS ?? 'n96yq9jMhRsAGfnn0_';
+  private readonly proxyPorts = [
+    10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010,
+  ];
+  private proxyIdx = 0;
+
+  private portCookies = new Map<number, Protocol.Network.Cookie[]>();
+
+  @Process({ name: 'parse', concurrency: 2 })
   async handle(job: Job<any>) {
     this.logger.log(
       '================================================================',
@@ -38,48 +63,199 @@ export class ParseProcessor {
     );
 
     let browser: Browser | null = null;
+
     try {
-      this.logger.log(`Запуск puppeteer...`);
-      browser = await puppeteerExtra.launch();
+      // (4) выбираем порт
+      let port = this.proxyPorts[this.proxyIdx++ % this.proxyPorts.length];
+
+      // локальная функция старта браузера с нужным портом
+      const launchWithProxy = async (portNum: number) => {
+        const proxyUrl = `http://${this.proxyHost}:${portNum}`; // (1) верный формат
+        this.logger.log(`Запуск puppeteer с proxy=${proxyUrl}`);
+        const br = await puppeteerExtra.launch({
+          headless: true,
+          args: [
+            `--proxy-server=${proxyUrl}`,
+            // (9) WebRTC/DNS leak mitigation
+            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+            '--disable-features=WebRtcHideLocalIpsWithMdns',
+            '--disable-webrtc-encryption',
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+          ],
+        });
+        return br;
+      };
+
+      browser = await launchWithProxy(port);
       this.logger.log(`Браузер запущен: ${!!browser}`);
 
-      const page = await browser.newPage();
+      let page = await browser.newPage();
       this.logger.log(`Создана новая вкладка`);
 
-      // Базовый UA (потом будем менять при ретраях)
-      const ua = faker.internet.userAgent();
-      await page.setUserAgent(ua);
-      this.logger.log(`Установлен User-Agent: ${ua}`);
-
-      // Отключаем кэш на старте
-      await page.setCacheEnabled(false);
-
-      // --- НАВИГАЦИЯ С РЕТРАЯМИ/429 + ожидание главного ответа + лог HTML/куки/заголовков ---
-      const resp = await this.gotoWithRetries(page, url, 3);
-      const status = resp?.status();
-      if (status === 429 || status === 503) {
-        this.logger.error(
-          `Не удалось обойти ${status} после повторных попыток`,
-        );
-        // При желании можно бросить ошибку для повторной постановки job
-        // throw new Error(`HTTP ${status}`);
+      // (1) proxy auth
+      if (this.proxyUser && this.proxyPass) {
+        await page.authenticate({
+          username: this.proxyUser,
+          password: this.proxyPass,
+        });
+        this.logger.log(`Proxy-авторизация применена`);
       }
 
-      await sleep(800);
+      const defaultUA = await page.evaluate(() => navigator.userAgent);
+      await page.setUserAgent(defaultUA);
+
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7', // (3)
+        DNT: '1',
+        'Upgrade-Insecure-Requests': '1',
+      });
+
+      await page.setViewport({ width: 1366, height: 850 });
+      await page.setCacheEnabled(false);
+
+      const prevCookies = this.portCookies.get(port);
+      if (prevCookies?.length) {
+        try {
+          await page.setCookie(
+            ...prevCookies.map((c) => ({
+              name: c.name,
+              value: c.value,
+              domain: c.domain || '.avito.ru',
+              path: c.path || '/',
+              expires: c.expires,
+              httpOnly: c.httpOnly,
+              secure: c.secure,
+              sameSite: (c.sameSite as any) ?? 'Lax',
+            })),
+          );
+          this.logger.log(
+            `Восстановлено куков для порта ${port}: ${prevCookies.length}`,
+          );
+        } catch (e) {
+          this.logger.warn(`Не удалось восстановить куки: ${e}`);
+        }
+      }
+
+      const maxAttempts = 5;
+      let resp: HTTPResponse | null = null;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        this.logger.log(
+          `Навигация (попытка ${attempt}/${maxAttempts}) url=${url}`,
+        );
+
+        await sleep(400 + Math.floor(Math.random() * 600));
+        await page.evaluate(() =>
+          window.scrollTo(0, Math.floor(Math.random() * 200)),
+        );
+
+        resp = await page
+          .goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+          .catch((e) => {
+            this.logger.warn(`page.goto выбросил ошибку: ${e}`);
+            return null;
+          });
+
+        const status = resp?.status();
+        const finalUrl = resp?.url();
+        this.logger.log(
+          `Результат навигации: статус=${status ?? 'нет'} адрес=${finalUrl ?? 'нет'}`,
+        );
+        await logPagePreview(this.logger, page, `nav-attempt-${attempt}`);
+        try {
+          const headers = resp?.headers() ?? {};
+          const keys = Object.keys(headers);
+          const preview: Record<string, string> = {};
+          keys.slice(0, 8).forEach((k) => (preview[k] = headers[k]));
+          this.logger.log(
+            `Заголовки ответа (первые ${Math.min(8, keys.length)}): ${JSON.stringify(preview)}`,
+          );
+        } catch (e) {
+          this.logger.warn(`Не удалось логировать заголовки: ${e}`);
+        }
+
+        try {
+          const gotCookies = await page.cookies();
+          this.portCookies.set(port, gotCookies as any);
+        } catch (e) {
+          this.logger.warn(`Не удалось получить куки: ${e}`);
+        }
+
+        if (status !== 429 && status !== 503) break;
+
+        const base = 2500 * Math.pow(1.6, attempt - 1);
+        const jitter = 800 + Math.floor(Math.random() * 1200);
+        const wait = Math.min(12000, Math.floor(base + jitter));
+        this.logger.warn(
+          `Получен ${status}. Ждём ${wait} мс, меняем прокси и пробуем заново...`,
+        );
+        await sleep(wait);
+
+        try {
+          await browser?.close();
+        } catch {}
+        port = this.proxyPorts[this.proxyIdx++ % this.proxyPorts.length];
+        browser = await launchWithProxy(port);
+        page = await browser.newPage();
+
+        if (this.proxyUser && this.proxyPass) {
+          await page.authenticate({
+            username: this.proxyUser,
+            password: this.proxyPass,
+          });
+        }
+
+        const portCk = this.portCookies.get(port);
+        if (portCk?.length) {
+          try {
+            await page.setCookie(
+              ...portCk.map((c) => ({
+                name: c.name,
+                value: c.value,
+                domain: c.domain || '.avito.ru',
+                path: c.path || '/',
+                expires: c.expires,
+                httpOnly: c.httpOnly,
+                secure: c.secure,
+                sameSite: (c.sameSite as any) ?? 'Lax',
+              })),
+            );
+          } catch (e) {
+            this.logger.warn(
+              `Не удалось восстановить куки на новом порту: ${e}`,
+            );
+          }
+        }
+
+        await page.setUserAgent(defaultUA);
+        await page.setExtraHTTPHeaders({
+          'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+          DNT: '1',
+          'Upgrade-Insecure-Requests': '1',
+        });
+        await page.setViewport({ width: 1366, height: 850 });
+        await page.setCacheEnabled(false);
+      }
+
+      const navStatus = resp?.status();
+      if (navStatus === 429 || navStatus === 503) {
+        this.logger.error(
+          `Не удалось обойти ${navStatus} после повторных попыток`,
+        );
+      }
+
+      await sleep(500 + Math.floor(Math.random() * 400));
 
       this.logger.log(`Попытка извлечь адрес (первая попытка)`);
       let value = await this.extractAddressFromPage(page);
       this.logger.log(`Извлечённое значение: ${value}`);
 
       if (!value) {
+        await logPagePreview(this.logger, page, 'before-reload-no-address');
         this.logger.log(
           'Адрес не найден, выполняем повторную загрузку и проверку изменения контента',
         );
-        let beforeHash = '';
-        try {
-          beforeHash = this.sha256(await page.content());
-        } catch {}
-
         await page.setCacheEnabled(false);
         try {
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
@@ -87,22 +263,7 @@ export class ParseProcessor {
         } catch (e) {
           this.logger.warn(`Ошибка при повторной загрузке: ${e}`);
         }
-
-        let afterHash = '';
-        try {
-          afterHash = this.sha256(await page.content());
-        } catch {}
-        this.logger.log(
-          `Контент-хэш: до=${beforeHash.slice(0, 8)} после=${afterHash.slice(0, 8)} ${beforeHash === afterHash ? '(без изменений)' : '(изменился)'}`,
-        );
-
-        // Доп. лог после reload
-        await this.logCookies(page, url);
-        try {
-          const htmlPreview = this.safeLogHtml(await page.content());
-          this.logger.log(`HTML превью после reload: ${htmlPreview}`);
-        } catch {}
-
+        await logPagePreview(this.logger, page, 'after-reload');
         value = await this.extractAddressFromPage(page);
         this.logger.log(
           `Извлечённое значение после повторной загрузки: ${value}`,
@@ -119,9 +280,7 @@ export class ParseProcessor {
       this.logger.log(
         `Отправка в webhook: ${webhookUrl}, данные=${JSON.stringify(payload)}`,
       );
-
       await this.webhook.send(webhookUrl, payload);
-
       this.logger.log(
         `Результат успешно отправлен: lead=${leadId} поля=[${fields.join(',')}]`,
       );
@@ -182,177 +341,16 @@ export class ParseProcessor {
         document.querySelectorAll('h2, h3, div, span'),
       ).find((el) => (el.textContent || '').trim() === 'Расположение');
       if (title) {
-        const container = title.parentElement || title;
+        const container = (title as HTMLElement).parentElement || title;
         const cand = container.querySelector(
           'span, p, div',
         ) as HTMLElement | null;
         const t5 = norm(cand?.innerText || cand?.textContent);
         if (t5) return t5;
       }
-
       return null;
     });
     this.logger.log(`extractAddressFromPage: результат=${result}`);
     return result;
-  }
-
-  // ===== ХЕЛПЕРЫ ДЛЯ БЕЗОПАСНОГО ЛОГИРОВАНИЯ/СРАВНЕНИЯ =====
-
-  private safeLogHtml(html: string | null | undefined, maxLen = 2000): string {
-    const s = (html ?? '').replace(/\s+/g, ' ').trim();
-    if (!s) return '[пусто]';
-    return s.length > maxLen ? s.slice(0, maxLen) + '…[обрезано]' : s;
-  }
-
-  private sha256(s: string): string {
-    return createHash('sha256')
-      .update(s || '')
-      .digest('hex');
-  }
-
-  // ===== "ОТПЕЧАТКИ" + ЛОГИ КУКИ/ЗАГОЛОВКОВ =====
-
-  /** Случайные отпечатки (UA, язык, viewport, заголовки) на попытку */
-  private async applyRandomFingerprint(page: Page, attempt: number) {
-    // 👉 если у тебя есть свой генератор, просто замени следующую строку на: const ua = uaFaker.random();
-    const ua = faker.internet.userAgent();
-
-    // немного варьируем язык между попытками
-    const acceptLanguage =
-      attempt % 2 === 0
-        ? 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
-        : 'ru,en-US;q=0.8,en;q=0.6';
-
-    // чуть-чуть варьируем viewport
-    const width = 1280 + Math.floor(Math.random() * 40);
-    const height = 800 + Math.floor(Math.random() * 40);
-
-    await page.setUserAgent(ua);
-    await page.setViewport({ width, height, deviceScaleFactor: 1 });
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': acceptLanguage,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Upgrade-Insecure-Requests': '1',
-      Pragma: 'no-cache',
-      'Cache-Control': 'no-cache',
-    });
-
-    this.logger.log(
-      `Отпечаток установлен: UA="${ua}", Lang="${acceptLanguage}", viewport=${width}x${height}`,
-    );
-  }
-
-  private logResponseHeaders(resp: HTTPResponse | null, limit = 12) {
-    if (!resp) {
-      this.logger.warn('Заголовки ответа: нет объекта ответа');
-      return;
-    }
-    const headers = resp.headers();
-    const keys = Object.keys(headers);
-    const preview = keys.slice(0, limit).reduce(
-      (acc, k) => {
-        acc[k] = headers[k];
-        return acc;
-      },
-      {} as Record<string, string>,
-    );
-    this.logger.log(
-      `Заголовки ответа (первые ${Math.min(limit, keys.length)}): ${JSON.stringify(preview)}`,
-    );
-  }
-
-  private async logCookies(page: Page, forUrl: string) {
-    const cookies = await page.cookies(forUrl);
-    const names = cookies.map((c) => c.name);
-    this.logger.log(
-      `Куки: всего=${cookies.length}, имена=[${names.join(', ')}]`,
-    );
-  }
-
-  private async gotoWithRetries(page: Page, url: string, maxAttempts = 3) {
-    let lastResp: HTTPResponse | null = null;
-    const base = url.split('?')[0];
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await this.applyRandomFingerprint(page, attempt);
-      await page.setCacheEnabled(false); // отключаем кэш перед попыткой
-
-      this.logger.log(
-        `Навигация (попытка ${attempt}/${maxAttempts}) url=${url}`,
-      );
-
-      const waitMainResponse = page
-        .waitForResponse(
-          (resp) => {
-            try {
-              const req = resp.request();
-              return req.isNavigationRequest() && resp.url().startsWith(base);
-            } catch {
-              return false;
-            }
-          },
-          { timeout: 60_000 },
-        )
-        .catch(() => null);
-
-      lastResp = await page
-        .goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-        .catch(() => null);
-
-      const mainResp = await waitMainResponse;
-      if (mainResp) lastResp = mainResp as HTTPResponse;
-
-      const status = lastResp?.status();
-      const finalUrl = lastResp?.url();
-      this.logger.log(
-        `Результат навигации: статус=${status ?? 'нет'} адрес=${finalUrl ?? 'нет'}`,
-      );
-      this.logResponseHeaders(lastResp);
-
-      await this.logCookies(page, url);
-
-      let rawHtml = '';
-      try {
-        rawHtml = (await lastResp?.text()) ?? '';
-      } catch {}
-      if (!rawHtml) {
-        try {
-          rawHtml = await page.content();
-        } catch {}
-      }
-      this.logger.log(`HTML превью: ${this.safeLogHtml(rawHtml)}`);
-
-      if (status !== 429 && status !== 503) {
-        return lastResp;
-      }
-
-      const backoffMs = 2000 * attempt + Math.floor(Math.random() * 1000);
-      this.logger.warn(
-        `Получен ${status}. Пауза ${backoffMs} мс, затем повтор…`,
-      );
-      await sleep(backoffMs);
-
-      let beforeHash = '';
-      try {
-        beforeHash = this.sha256(await page.content());
-      } catch {}
-
-      try {
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
-        this.logger.log(`Reload выполнен`);
-      } catch (e) {
-        this.logger.warn(`Ошибка reload: ${e}`);
-      }
-
-      let afterHash = '';
-      try {
-        afterHash = this.sha256(await page.content());
-      } catch {}
-      this.logger.log(
-        `Сравнение контента после reload: до=${beforeHash.slice(0, 8)} после=${afterHash.slice(0, 8)} ${beforeHash === afterHash ? '(без изменений)' : '(изменился)'}`,
-      );
-    }
-
-    return lastResp;
   }
 }

@@ -8,7 +8,9 @@ import { EnqueueParseDto } from './dto/enqueue-parse.dto';
 export class ParserService {
   private readonly logger = new Logger(ParserService.name);
 
-  constructor(@InjectQueue(PARSE_QUEUE) private readonly queue: Queue) {}
+  constructor(
+    @InjectQueue(PARSE_QUEUE) private readonly queue: Queue,
+  ) {}
 
   async enqueue(dto: EnqueueParseDto) {
     const payload = {
